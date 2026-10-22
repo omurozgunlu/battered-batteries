@@ -1,0 +1,11 @@
+.git*
+.azurite/
+local.settings.json
+local.settings.example.json
+src/
+tests/
+tsconfig.json
+vitest.config.*
+coverage/
+*.md
+*.yaml

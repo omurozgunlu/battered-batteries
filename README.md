@@ -1,0 +1,172 @@
+# Battered Batteries
+
+Azure Functions v4 programming model project in TypeScript. The battery API client
+is implemented and has one mocked Vitest test. Queue processing is still a placeholder.
+
+## Setup
+
+Use Node.js 24 (`nvm use` if you have nvm), then:
+
+```bash
+npm ci
+cp local.settings.example.json local.settings.json
+npm run build
+```
+
+Azure Functions Core Tools (`func`) and Azurite are project-local development
+dependencies. npm scripts find their executables automatically; no global install
+is needed. The first install downloads the Core Tools runtime binary.
+
+## Local configuration
+
+The Functions host reads settings from the `Values` object in `local.settings.json`
+and supplies them as environment variables. This project does not load `.env`.
+`local.settings.json` is ignored by Git.
+
+| Setting | Purpose |
+| --- | --- |
+| `AzureWebJobsStorage` | Host storage; the example uses local Azurite. |
+| `FUNCTIONS_WORKER_RUNTIME` | Selects the Node.js worker. |
+| `AzureWebJobs.forwardSetpoints.Disabled` | Keeps the unfinished queue trigger disabled locally. |
+| `CONNECTION-STRING-SBQ-BATBAT-SPT` | Service Bus connection string supplied separately from the API key. |
+| `BATTERED_BATTERIES_API_URL` | Base URL for the HTTP client. |
+| `BATTERED_BATTERIES_API_KEY` | Copy the API key from the assignment here. |
+
+The assignment supplies an API key, but no Service Bus connection string. The API
+key cannot authenticate to Service Bus. Azurite emulates Azure Storage for the host;
+it does not emulate Service Bus.
+
+## Run locally
+
+Start storage in one terminal:
+
+```bash
+npm run storage
+```
+
+Start the Functions host in another terminal:
+
+```bash
+npm start
+```
+
+`npm start` builds TypeScript before launching the host. The host may download its
+extension bundle on the first run, which requires internet access. No queue messages
+are consumed while the function is disabled.
+
+Once forwarding is implemented and you have a Service Bus connection string, fill
+in the connection setting and change `AzureWebJobs.forwardSetpoints.Disabled` to
+`"false"`. The configured queue must exist. Restart the host after changing settings
+or source code. The processor is still a placeholder and does not forward commands yet.
+
+## Files
+
+- `src/functions/forwardSetpoints.ts`: registers a batched Service Bus trigger
+  using `app.serviceBusQueue` and constructs the shared processor and API client.
+- `src/handlers/forwardSetpoints.ts`: validates and transforms individual messages,
+  then passes internal `SetPoint` values and invocation context to the injected processor.
+- `package.json`: `main` tells the worker to load compiled `dist/functions/*.js`.
+- `tsconfig.json`: compiles `src/` into `dist/` with strict type checking.
+- `host.json`: host settings and the extension bundle that supplies Service Bus bindings.
+  Its `version: "2.0"` is the host configuration schema, not the programming model version.
+- `local.settings.example.json`: copyable local configuration without credentials.
+- `src/clients/batteredBatteries.ts`: Axios client with bounded retries and expiry handling.
+- `src/clients/batteredBatteries.types.ts`: Zod schemas and inferred types for the client
+  input and vendor HTTP request, including integer values and timestamp ordering.
+- `src/types/dto/setpointMessage.ts`: incoming `SetPointMessageSchema` and its inferred
+  `SetPointMessage` type, preserving the nested message shape and ISO date strings.
+- `src/mappers/toSetPoint.ts`: pure conversion from a validated DTO to a flat `SetPoint`.
+- `src/types/setpoint.ts`: internal representation, with timestamps in Unix milliseconds
+  and power in kW using the incoming grid sign convention.
+- `tests/`: the assignment's single Vitest test and remaining test TODO comments.
+
+No `function.json` is needed: the v4 programming model registers the trigger in code.
+The handler is wired to `MessageProcessor`, whose processing methods are still empty.
+
+## Incoming message failure policy
+
+The handler composes `SetPointMessageSchema.transform(toSetPoint)` and calls `safeParse`
+on each element. Valid DTOs become flat `SetPoint` values; ISO dates become numeric
+Unix millisecond timestamps. The raw DTO schema remains available independently. Malformed
+entries are logged and skipped; warnings include the entry index and validation
+issues, without the raw payload. Valid messages retain their original order and are
+passed to `processMessages` together. Empty batches and batches without valid entries
+return successfully without calling the processor.
+
+Processor failures propagate to fail the invocation. With automatic Service Bus
+settlement, successful invocations complete their messages, including intentionally
+skipped malformed entries; failed invocations can cause batch redelivery. This policy
+does not individually dead-letter malformed messages. Previously processed entries
+may be delivered again after a failed batch.
+
+## Battery API client
+
+Create one client per worker and reuse it across batches:
+
+```typescript
+import { BatteredBatteriesClient } from './clients/batteredBatteries';
+
+const client = new BatteredBatteriesClient(); // Reads API URL/key from the environment.
+
+await client.sendSetpoint('BB00001', {
+  value: -1_000, // Integer watts in API convention: negative discharges.
+  endTime: Math.floor(Date.now() / 1_000) + 60,
+});
+```
+
+The handler owns input validation. The processor owns the device allowlist, kW-to-W
+conversion with sign inversion, and ordering by eventTime. The processor must also convert
+internal millisecond end times to whole Unix seconds when calling the client.
+The client accepts already-converted watts
+and an absolute Unix end time in seconds. It generates the earliest future whole-second
+start time on each attempt, and never extends the end time. A command with no remaining
+valid start time throws `SetpointExpiredError` without another request.
+
+Defaults are a 5-second request timeout, 4 total attempts, a 30-second total budget
+(including local queueing), and exponential backoff capped at 5 seconds. Each retry
+waits a random duration between half and all of its exponential delay. These settings
+are constructor options. `Retry-After` in seconds or HTTP-date form takes precedence
+when it requires a longer delay; the client fails rather than retrying early if the
+delay cannot fit within the budget or command lifetime.
+
+Only HTTP 204 is success; no response body is required. The client retries HTTP 408,
+429, 500, 502, 503, and 504 plus selected network/timeout errors. Other failures,
+including 400/401/404, fail immediately. `BatteredBatteriesApiError` exposes attempts,
+HTTP status, and transport code without retaining Axios config or the API key.
+Invalid client input or HTTP request data throws a Zod validation error before an
+HTTP request is sent. The client generates a future start time; the outgoing schema
+requires positive integer timestamps, an end time later than the start, and integer watts.
+Request validation runs on each
+attempt because the start time changes; input validation runs before queueing.
+
+Calls on one client are serialized, including retries, and share the server cooldown.
+This limits local concurrency and prevents a local retry from overtaking a later
+submission. It does not impose a requests-per-second limit or coordinate multiple
+workers. The processor/host must manage scale and duplicate or out-of-order deliveries.
+Avoid adding an independent retry loop around the client without accounting for
+Service Bus redelivery and message lock duration.
+
+Retrying a POST assumes the documented replacement behavior: resending the desired
+value with its original end time replaces the same battery command. A timeout leaves
+delivery uncertain; serialization cannot guarantee ordering at the vendor after a
+timed-out request, or across workers. The API supplies no idempotency key or version
+field. Automatic one-second clearing is not part of this client.
+
+## Checks
+
+```bash
+npm run typecheck
+npm run build
+npm test
+```
+
+Vitest discovers `*.test.ts` files without additional configuration. The one client
+test uses fake time and a mocked Axios adapter; remaining scenarios are TODO comments.
+
+## References
+
+- [Azure Functions Node.js programming model](https://learn.microsoft.com/en-us/azure/azure-functions/functions-reference-node)
+- [Service Bus trigger and batching](https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-service-bus-trigger)
+- [Azure Functions Core Tools](https://github.com/Azure/azure-functions-core-tools)
+- [Azurite storage emulator](https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azurite)
+- [Vitest](https://vitest.dev/guide/)

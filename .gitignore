@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+.azurite/
+local.settings.json
+.env
+.env.*
+*.log
