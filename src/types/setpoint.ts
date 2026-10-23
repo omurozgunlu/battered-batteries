@@ -1,5 +1,5 @@
 export type SetPoint = {
-  device_id: string;
+  deviceId: string;
   value: number;
   unit: "kW";
   /** Unix timestamp in milliseconds. */

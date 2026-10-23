@@ -57,7 +57,7 @@ are consumed while the function is disabled.
 Once forwarding is implemented and you have a Service Bus connection string, fill
 in the connection setting and change `AzureWebJobs.forwardSetpoints.Disabled` to
 `"false"`. The configured queue must exist. Restart the host after changing settings
-or source code. The processor is still a placeholder and does not forward commands yet.
+or source code. The processor currently filters and maps commands but does not send them yet.
 
 ## Files
 
@@ -70,18 +70,22 @@ or source code. The processor is still a placeholder and does not forward comman
 - `host.json`: host settings and the extension bundle that supplies Service Bus bindings.
   Its `version: "2.0"` is the host configuration schema, not the programming model version.
 - `local.settings.example.json`: copyable local configuration without credentials.
-- `src/clients/batteredBatteries.ts`: Axios client with bounded retries and expiry handling.
-- `src/clients/batteredBatteries.types.ts`: Zod schemas and inferred types for the client
-  input and vendor HTTP request, including integer values and timestamp ordering.
+- `src/clients/batteredBatteries/client.ts`: Axios client with bounded retries and expiry handling.
+- `src/clients/batteredBatteries/errors.ts`: API failure and setpoint expiry error classes.
+- `src/clients/batteredBatteries/types.ts`: plain `ApiRequest` type, with a path device ID
+  and HTTP request data in seconds and watts.
 - `src/types/dto/setpointMessage.ts`: incoming `SetPointMessageSchema` and its inferred
   `SetPointMessage` type, preserving the nested message shape and ISO date strings.
 - `src/mappers/toSetPoint.ts`: pure conversion from a validated DTO to a flat `SetPoint`.
+- `src/mappers/toApi.ts`: converts internal milliseconds/kW into API seconds/watts
+  with a future start based on current time and the configured lead time.
 - `src/types/setpoint.ts`: internal representation, with timestamps in Unix milliseconds
   and power in kW using the incoming grid sign convention.
 - `tests/`: the assignment's single Vitest test and remaining test TODO comments.
 
 No `function.json` is needed: the v4 programming model registers the trigger in code.
-The handler is wired to `MessageProcessor`, whose processing methods are still empty.
+The handler is wired to `MessageProcessor`. Its remaining forwarding step is to call
+`apiClient.sendSetpoint(request)` for each prepared API request.
 
 ## Incoming message failure policy
 
@@ -104,28 +108,40 @@ may be delivered again after a failed batch.
 Create one client per worker and reuse it across batches:
 
 ```typescript
-import { BatteredBatteriesClient } from './clients/batteredBatteries';
+import { BatteredBatteriesClient } from './clients/batteredBatteries/client';
 
-const client = new BatteredBatteriesClient(); // Reads API URL/key from the environment.
+// Read environment settings in application setup and pass them to the client.
+const client = new BatteredBatteriesClient({
+  apiKey: process.env.BATTERED_BATTERIES_API_KEY,
+  baseURL: process.env.BATTERED_BATTERIES_API_URL ?? 'https://BatB.azure-api.net',
+});
 
-await client.sendSetpoint('BB00001', {
-  value: -1_000, // Integer watts in API convention: negative discharges.
-  endTime: Math.floor(Date.now() / 1_000) + 60,
+const now = Math.floor(Date.now() / 1_000);
+await client.sendSetpoint({
+  deviceId: 'BB00001',
+  data: {
+    startTime: now + 1,
+    endTime: now + 60,
+    value: -1_000, // Integer watts in API convention: negative discharges.
+  },
 });
 ```
 
 The handler owns input validation. The processor owns the device allowlist, kW-to-W
-conversion with sign inversion, and ordering by eventTime. The processor must also convert
-internal millisecond end times to whole Unix seconds when calling the client.
-The client accepts already-converted watts
-and an absolute Unix end time in seconds. It generates the earliest future whole-second
-start time on each attempt, and never extends the end time. A command with no remaining
-valid start time throws `SetpointExpiredError` without another request.
+conversion with sign inversion, and ordering by eventTime. `toApiRequest` performs the
+unit conversion: it rounds power to integer watts, floors the end time to Unix seconds,
+and chooses a future whole-second start after current time plus the supplied millisecond
+offset. The client takes this complete `ApiRequest`, uses `deviceId` in the URL, and
+sends only `{ data }` as JSON. If queueing or retries make startTime stale, the client
+refreshes it to the next whole second while preserving the original endTime and value.
+A command with no remaining valid start time throws `SetpointExpiredError`.
 
 Defaults are a 5-second request timeout, 4 total attempts, a 30-second total budget
 (including local queueing), and exponential backoff capped at 5 seconds. Each retry
 waits a random duration between half and all of its exponential delay. These settings
-are constructor options. `Retry-After` in seconds or HTTP-date form takes precedence
+live together in the client's `RETRY_POLICY` constant; constructor options are API key
+and base URL. Configuration validation will be handled by a separate module.
+`Retry-After` in seconds or HTTP-date form takes precedence
 when it requires a longer delay; the client fails rather than retrying early if the
 delay cannot fit within the budget or command lifetime.
 
@@ -133,11 +149,11 @@ Only HTTP 204 is success; no response body is required. The client retries HTTP 
 429, 500, 502, 503, and 504 plus selected network/timeout errors. Other failures,
 including 400/401/404, fail immediately. `BatteredBatteriesApiError` exposes attempts,
 HTTP status, and transport code without retaining Axios config or the API key.
-Invalid client input or HTTP request data throws a Zod validation error before an
-HTTP request is sent. The client generates a future start time; the outgoing schema
-requires positive integer timestamps, an end time later than the start, and integer watts.
-Request validation runs on each
-attempt because the start time changes; input validation runs before queueing.
+The outgoing request uses a plain TypeScript type. Small runtime guards reject invalid
+device IDs, noninteger watts/timestamps, nonpositive timestamps, or endTime at or before
+startTime with `TypeError`. The client has no Zod dependency; incoming queue messages
+continue to use Zod validation. Request data is copied before queueing so retries do
+not mutate the caller's object. Timing and expiry are checked for every attempt.
 
 Calls on one client are serialized, including retries, and share the server cooldown.
 This limits local concurrency and prevents a local retry from overtaking a later
@@ -160,7 +176,7 @@ npm run build
 npm test
 ```
 
-Vitest discovers `*.test.ts` files without additional configuration. The one client
+Vitest discovers `*.test.ts` files without additional configuration. The one mapper/client
 test uses fake time and a mocked Axios adapter; remaining scenarios are TODO comments.
 
 ## References
@@ -170,3 +186,5 @@ test uses fake time and a mocked Axios adapter; remaining scenarios are TODO com
 - [Azure Functions Core Tools](https://github.com/Azure/azure-functions-core-tools)
 - [Azurite storage emulator](https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azurite)
 - [Vitest](https://vitest.dev/guide/)
+- [Axios request configuration](https://axios-http.com/docs/req_config)
+- [Transient fault handling and retry guidance](https://learn.microsoft.com/en-us/azure/architecture/best-practices/transient-faults)
