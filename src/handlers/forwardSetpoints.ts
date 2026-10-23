@@ -5,7 +5,7 @@ import type { SetPoint } from "../types/setpoint";
 import { SetPointMessageSchema } from "../types/dto/setpointMessage";
 import { toSetPoint } from "../mappers/toSetPoint";
 
-type Processor = Pick<MessageProcessor, "processMessages">;
+type Processor = Pick<MessageProcessor, "process">;
 
 export function createForwardSetpoints(processor: Processor) {
   return async function forwardSetpoints(
@@ -26,7 +26,7 @@ export function createForwardSetpoints(processor: Processor) {
     }
 
     // Processing failures must propagate so an unsuccessful batch can be redelivered.
-    await processor.processMessages(setpoints, context);
+    await processor.process(setpoints, context);
   };
 }
 

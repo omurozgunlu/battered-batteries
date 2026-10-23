@@ -70,7 +70,11 @@ or source code. The processor currently filters and maps commands but does not s
 - `host.json`: host settings and the extension bundle that supplies Service Bus bindings.
   Its `version: "2.0"` is the host configuration schema, not the programming model version.
 - `local.settings.example.json`: copyable local configuration without credentials.
-- `src/clients/batteredBatteries/client.ts`: Axios client with bounded retries and expiry handling.
+- `src/clients/batteredBatteries/client.ts`: HTTP requests, `axios-retry` setup,
+  and setpoint timing/expiry handling.
+- `src/clients/batteredBatteries/refreshSetpoint.ts`: pure start-time refresh and
+  expiry check using an explicitly supplied current time.
+- `src/clients/batteredBatteries/constants.ts`: retry limits and retryable HTTP/network errors.
 - `src/clients/batteredBatteries/errors.ts`: API failure and setpoint expiry error classes.
 - `src/clients/batteredBatteries/types.ts`: plain `ApiRequest` type, with a path device ID
   and HTTP request data in seconds and watts.
@@ -109,11 +113,12 @@ Create one client per worker and reuse it across batches:
 
 ```typescript
 import { BatteredBatteriesClient } from './clients/batteredBatteries/client';
+import { loadConfig } from './config';
 
-// Read environment settings in application setup and pass them to the client.
+const config = loadConfig();
 const client = new BatteredBatteriesClient({
-  apiKey: process.env.BATTERED_BATTERIES_API_KEY,
-  baseURL: process.env.BATTERED_BATTERIES_API_URL ?? 'https://BatB.azure-api.net',
+  apiKey: config.BATTERED_BATTERIES_API_KEY,
+  baseURL: config.BATTERED_BATTERIES_API_URL,
 });
 
 const now = Math.floor(Date.now() / 1_000);
@@ -132,40 +137,48 @@ conversion with sign inversion, and ordering by eventTime. `toApiRequest` perfor
 unit conversion: it rounds power to integer watts, floors the end time to Unix seconds,
 and chooses a future whole-second start after current time plus the supplied millisecond
 offset. The client takes this complete `ApiRequest`, uses `deviceId` in the URL, and
-sends only `{ data }` as JSON. If queueing or retries make startTime stale, the client
+sends only `{ data }` as JSON. If retries make startTime stale, the client
 refreshes it to the next whole second while preserving the original endTime and value.
 A command with no remaining valid start time throws `SetpointExpiredError`.
 
-Defaults are a 5-second request timeout, 4 total attempts, a 30-second total budget
-(including local queueing), and exponential backoff capped at 5 seconds. Each retry
-waits a random duration between half and all of its exponential delay. These settings
-live together in the client's `RETRY_POLICY` constant; constructor options are API key
-and base URL. Configuration validation will be handled by a separate module.
-`Retry-After` in seconds or HTTP-date form takes precedence
-when it requires a longer delay; the client fails rather than retrying early if the
-delay cannot fit within the budget or command lifetime.
+`axios-retry` controls retries: 3 retries after the initial request, giving 4 total
+attempts. Limits remain in `RETRY_POLICY` in `constants.ts`: a 5-second timeout per
+attempt, a 30-second total budget, and exponential backoff capped
+at 5 seconds. The plugin provides exponential delay with jitter and `Retry-After`
+parsing. The client caps the backoff and honors a longer `Retry-After` separately.
+One cancellation signal bounds the whole command, including HTTP attempts and
+retry delays. It expires after 30 seconds or at the setpoint end
+time, whichever comes first. A long `Retry-After` is interrupted at that deadline;
+the client does not retry early. Constructor options remain API key and base URL;
+`loadConfig` handles configuration separately.
+
+A normal Axios request interceptor refreshes the start time and rejects expired
+setpoints before each attempt through the pure `refreshSetpoint` helper. The
+interceptor handles both the initial object body and the serialized JSON reused
+by `axios-retry`. Axios applies its 5-second HTTP timeout per attempt;
+the command's cancellation signal provides the overall deadline. There are no
+per-attempt transformers or signal-reset hooks.
 
 Only HTTP 204 is success; no response body is required. The client retries HTTP 408,
 429, 500, 502, 503, and 504 plus selected network/timeout errors. Other failures,
 including 400/401/404, fail immediately. `BatteredBatteriesApiError` exposes attempts,
 HTTP status, and transport code without retaining Axios config or the API key.
-The outgoing request uses a plain TypeScript type. Small runtime guards reject invalid
-device IDs, noninteger watts/timestamps, nonpositive timestamps, or endTime at or before
-startTime with `TypeError`. The client has no Zod dependency; incoming queue messages
-continue to use Zod validation. Request data is copied before queueing so retries do
-not mutate the caller's object. Timing and expiry are checked for every attempt.
+The outgoing request uses a plain TypeScript type. The client rejects endTime at or
+before startTime with `TypeError`; incoming queue messages continue to use Zod
+validation. The timing helper returns a new request so retries do not mutate the
+caller's object. Timing and expiry are checked for every attempt.
 
-Calls on one client are serialized, including retries, and share the server cooldown.
-This limits local concurrency and prevents a local retry from overtaking a later
-submission. It does not impose a requests-per-second limit or coordinate multiple
-workers. The processor/host must manage scale and duplicate or out-of-order deliveries.
+Calls run independently, including calls for the same device. Retry backoff and
+`Retry-After` apply only to the affected command; the client has no queue, shared
+cooldown, or concurrency limit. The caller controls concurrency, while the
+processor/host must manage scale and duplicate or out-of-order deliveries.
 Avoid adding an independent retry loop around the client without accounting for
 Service Bus redelivery and message lock duration.
 
 Retrying a POST assumes the documented replacement behavior: resending the desired
 value with its original end time replaces the same battery command. A timeout leaves
-delivery uncertain; serialization cannot guarantee ordering at the vendor after a
-timed-out request, or across workers. The API supplies no idempotency key or version
+delivery uncertain; overlapping commands and retries can arrive out of order at
+the vendor, within one worker or across workers. The API supplies no idempotency key or version
 field. Automatic one-second clearing is not part of this client.
 
 ## Checks
@@ -187,4 +200,5 @@ test uses fake time and a mocked Axios adapter; remaining scenarios are TODO com
 - [Azurite storage emulator](https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azurite)
 - [Vitest](https://vitest.dev/guide/)
 - [Axios request configuration](https://axios-http.com/docs/req_config)
+- [axios-retry configuration and Retry-After support](https://github.com/softonic/axios-retry)
 - [Transient fault handling and retry guidance](https://learn.microsoft.com/en-us/azure/architecture/best-practices/transient-faults)

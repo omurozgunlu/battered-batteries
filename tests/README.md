@@ -1,7 +1,9 @@
 # Tests
 
 Run `npm test`. The single implemented test in `batteredBatteries.test.ts` exercises
-the API client's 429 Retry-After and 500 backoff path through a mocked Axios adapter.
+the API client's 429 Retry-After and 500 backoff path using the real `axios-retry`
+plugin and a mocked Axios adapter. A second command succeeds immediately while the
+first command waits for its retries.
 It also checks the outgoing request and that retries preserve expiry while refreshing
 the future start time without mutating the caller's request. The request is built by
 `toApiRequest`, so the test also covers current-time scheduling and milliseconds/kW

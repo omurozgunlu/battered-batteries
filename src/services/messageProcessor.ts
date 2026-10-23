@@ -3,6 +3,7 @@ import type { BatteredBatteriesClient } from "../clients/batteredBatteries/clien
 import type { SetPoint } from "../types/setpoint";
 import { isAllowedDevice } from "../constants/allowedDevices";
 import { toApiRequest } from "../mappers/toApi";
+import { SetpointExpiredError } from "../clients/batteredBatteries/errors";
 
 export class MessageProcessor {
   private readonly apiClient: BatteredBatteriesClient;
@@ -12,18 +13,45 @@ export class MessageProcessor {
     this.apiClient = apiClient;
   }
 
-  async processMessages(
+  async process(
     setpoints: SetPoint[],
     invocationContext: InvocationContext,
   ): Promise<void> {
     const allowedSetpoints = setpoints.filter((setpoint) =>
       isAllowedDevice(setpoint.deviceId),
     );
-    const latestSetpoints = this.latestPerDevice(allowedSetpoints);
-    const recentSetpoints = this.filterOutdated(latestSetpoints);
-    const apiPayload = recentSetpoints.map((setpoint) =>
-      toApiRequest(setpoint, this.timeOffset),
+
+    const recentSetpoints = this.filterOutdated(allowedSetpoints);
+    const latestSetpoints = this.latestPerDevice(recentSetpoints);
+
+    const results = await Promise.allSettled(
+      recentSetpoints.map(async (setpoint) => {
+        const request = toApiRequest(setpoint, this.timeOffset);
+        await this.apiClient.sendSetpoint(request);
+      }),
     );
+
+    const failures: unknown[] = [];
+
+    results.forEach((result, idx) => {
+      const deviceId = latestSetpoints[idx].deviceId;
+      if (result.status === "fulfilled") {
+        invocationContext.log(`Setpoint sent for ${deviceId}`);
+        return;
+      }
+      if (result.reason instanceof SetpointExpiredError) {
+        invocationContext.warn(`Setpoint expired for ${deviceId}`);
+        return;
+      }
+      invocationContext.error(
+        `Failed to send setpoint for ${deviceId}: ${result.reason}`,
+      );
+      failures.push(result.reason);
+
+      if (failures.length > 0) {
+        throw new Error(`Failed to send setpoints for devices: ${failures}`);
+      }
+    });
   }
 
   private latestPerDevice(setpoints: SetPoint[]): SetPoint[] {
