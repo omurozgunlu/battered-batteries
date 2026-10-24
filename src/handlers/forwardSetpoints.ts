@@ -4,6 +4,7 @@ import type { MessageProcessor } from "../services/messageProcessor";
 import type { SetPoint } from "../types/setpoint";
 import { SetPointMessageSchema } from "../types/dto/setpointMessage";
 import { toSetPoint } from "../mappers/toSetPoint";
+import { ProcessResult } from "../services/types";
 
 type Processor = Pick<MessageProcessor, "process">;
 
@@ -25,9 +26,44 @@ export function createForwardSetpoints(processor: Processor) {
       return;
     }
 
-    // Processing failures must propagate so an unsuccessful batch can be redelivered.
-    await processor.process(setpoints, context);
+    const results = await processor.process(setpoints);
+    handleResults(results, context);
   };
+}
+
+function handleResults(results: ProcessResult[], context: InvocationContext) {
+  const failures = [];
+  for (const result of results) {
+    switch (result.status) {
+      case "success":
+        context.log(
+          `Setpoint for device ${result.deviceId} processed successfully.`,
+        );
+        break;
+      case "expired":
+        context.warn(`Setpoint for device ${result.deviceId} has expired.`);
+        break;
+      case "rejected":
+        context.error(`Setpoint for device ${result.deviceId} was rejected.`, {
+          error: result.error,
+        });
+        break;
+      case "failed":
+        context.error(`Setpoint for device ${result.deviceId} failed.`, {
+          error: result.error,
+        });
+        failures.push(result);
+        break;
+    }
+  }
+  if (failures.length > 0) {
+    context.error(`There were ${failures.length} failed setpoints.`);
+    throw new Error(
+      `Failed to forward ${failures.length} setpoint(s): ${failures
+        .map((failure) => failure.deviceId)
+        .join(", ")}.`,
+    );
+  }
 }
 
 function parseSetpointMessages(

@@ -1,42 +1,46 @@
 # Battered Batteries
 
-Azure Functions v4 programming model project in TypeScript. The battery API client
-is implemented and has one mocked Vitest test. Queue processing is still a placeholder.
+A TypeScript Azure Functions v4 application that consumes batches from the Service
+Bus queue `sbq-batbat-spt`, validates and selects battery setpoints, then forwards
+them to the Battered Batteries API using Axios.
 
 ## Setup
 
-Use Node.js 24 (`nvm use` if you have nvm), then:
+Use Node.js 24 (`nvm use` if you use nvm):
 
 ```bash
 npm ci
 cp local.settings.example.json local.settings.json
-npm run build
 ```
 
-Azure Functions Core Tools (`func`) and Azurite are project-local development
-dependencies. npm scripts find their executables automatically; no global install
-is needed. The first install downloads the Core Tools runtime binary.
+Azure Functions Core Tools and Azurite are project-local development dependencies.
+The npm scripts find their executables automatically. Installing Core Tools and
+starting the Functions host for the first time may require downloads.
 
-## Local configuration
+### Configuration
 
-The Functions host reads settings from the `Values` object in `local.settings.json`
-and supplies them as environment variables. This project does not load `.env`.
-`local.settings.json` is ignored by Git.
+Fill in the `Values` object in `local.settings.json`:
 
 | Setting | Purpose |
 | --- | --- |
-| `AzureWebJobsStorage` | Host storage; the example uses local Azurite. |
-| `FUNCTIONS_WORKER_RUNTIME` | Selects the Node.js worker. |
-| `AzureWebJobs.forwardSetpoints.Disabled` | Keeps the unfinished queue trigger disabled locally. |
-| `CONNECTION-STRING-SBQ-BATBAT-SPT` | Service Bus connection string supplied separately from the API key. |
-| `BATTERED_BATTERIES_API_URL` | Base URL for the HTTP client. |
-| `BATTERED_BATTERIES_API_KEY` | Copy the API key from the assignment here. |
+| `AzureWebJobsStorage` | Host storage; `UseDevelopmentStorage=true` uses local Azurite. |
+| `FUNCTIONS_WORKER_RUNTIME` | Set to `node`. |
+| `AzureWebJobs.forwardSetpoints.Disabled` | Defaults to `"true"` in the example. Set to `"false"` when ready to consume messages. |
+| `CONNECTION-STRING-SBQ-BATBAT-SPT` | Connection string for the Service Bus namespace containing the queue. |
+| `BATTERED_BATTERIES_API_URL` | API base URL; the supplied specification uses `https://BatB.azure-api.net`. |
+| `BATTERED_BATTERIES_API_KEY` | API subscription key supplied with the assignment. |
 
-The assignment supplies an API key, but no Service Bus connection string. The API
-key cannot authenticate to Service Bus. Azurite emulates Azure Storage for the host;
-it does not emulate Service Bus.
+The Functions host supplies these values as environment variables; the application
+does not load `.env`. `loadConfig()` requires nonempty API URL and key values at
+module initialization, including when the queue trigger is disabled. The Service
+Bus connection is resolved by the trigger binding from the named setting.
 
-## Run locally
+The API key and Service Bus connection string are separate credentials. The
+assignment supplies an API key; obtain the Service Bus connection string separately.
+Azurite emulates Azure Storage for the host, not Service Bus. Local settings are
+ignored by Git. In Azure, configure the corresponding application settings.
+
+### Run locally
 
 Start storage in one terminal:
 
@@ -50,136 +54,159 @@ Start the Functions host in another terminal:
 npm start
 ```
 
-`npm start` builds TypeScript before launching the host. The host may download its
-extension bundle on the first run, which requires internet access. No queue messages
-are consumed while the function is disabled.
+`npm start` builds TypeScript before launching the host. To consume messages, the
+queue must exist, its connection setting must be populated, and the function must
+be enabled. Restart the host after changing source code or settings.
 
-Once forwarding is implemented and you have a Service Bus connection string, fill
-in the connection setting and change `AzureWebJobs.forwardSetpoints.Disabled` to
-`"false"`. The configured queue must exist. Restart the host after changing settings
-or source code. The processor currently filters and maps commands but does not send them yet.
+This is a Service Bus trigger; it exposes no HTTP endpoint. Publish messages to
+`sbq-batbat-spt` to exercise the running function. Enabled local execution forwards
+selected commands to the configured API. Use `npm test` for mocked execution that
+requires neither Azure credentials nor a running host.
 
-## Files
+## Processing flow
 
-- `src/functions/forwardSetpoints.ts`: registers a batched Service Bus trigger
-  using `app.serviceBusQueue` and constructs the shared processor and API client.
-- `src/handlers/forwardSetpoints.ts`: validates and transforms individual messages,
-  then passes internal `SetPoint` values and invocation context to the injected processor.
-- `package.json`: `main` tells the worker to load compiled `dist/functions/*.js`.
-- `tsconfig.json`: compiles `src/` into `dist/` with strict type checking.
-- `host.json`: host settings and the extension bundle that supplies Service Bus bindings.
-  Its `version: "2.0"` is the host configuration schema, not the programming model version.
-- `local.settings.example.json`: copyable local configuration without credentials.
-- `src/clients/batteredBatteries/client.ts`: HTTP requests, `axios-retry` setup,
-  and setpoint timing/expiry handling.
-- `src/clients/batteredBatteries/refreshSetpoint.ts`: pure start-time refresh and
-  expiry check using an explicitly supplied current time.
-- `src/clients/batteredBatteries/constants.ts`: retry limits and retryable HTTP/network errors.
-- `src/clients/batteredBatteries/errors.ts`: API failure and setpoint expiry error classes.
-- `src/clients/batteredBatteries/types.ts`: plain `ApiRequest` type, with a path device ID
-  and HTTP request data in seconds and watts.
-- `src/types/dto/setpointMessage.ts`: incoming `SetPointMessageSchema` and its inferred
-  `SetPointMessage` type, preserving the nested message shape and ISO date strings.
-- `src/mappers/toSetPoint.ts`: pure conversion from a validated DTO to a flat `SetPoint`.
-- `src/mappers/toApi.ts`: converts internal milliseconds/kW into API seconds/watts
-  with a future start based on current time and the configured lead time.
-- `src/types/setpoint.ts`: internal representation, with timestamps in Unix milliseconds
-  and power in kW using the incoming grid sign convention.
-- `tests/`: the assignment's single Vitest test and remaining test TODO comments.
+1. `src/functions/forwardSetpoints.ts` loads configuration, constructs a reusable
+   client and processor, and registers the batched Service Bus trigger.
+2. The handler validates each array element with `SetPointMessageSchema.safeParse`.
+   Invalid entries are logged with their index and validation issues, then skipped.
+   The raw message is not logged. Valid DTOs are mapped to internal `SetPoint` values.
+3. The processor filters the device allowlist, keeps the greatest `eventTime` for
+   each device within the batch, then removes commands whose `endTime` has passed.
+   Equal event times keep the first occurrence. Selecting before filtering expiry
+   prevents falling back to an older command when the newest one has expired.
+4. Each selected command is mapped to an API request and sent concurrently.
+   `Promise.allSettled` allows every selected command to finish before results
+   are classified.
+5. The handler logs the results and throws if any command has status `failed`.
+   Empty batches and batches without valid messages return without calling the
+   processor.
 
-No `function.json` is needed: the v4 programming model registers the trigger in code.
-The handler is wired to `MessageProcessor`. Its remaining forwarding step is to call
-`apiClient.sendSetpoint(request)` for each prepared API request.
+Allowed devices are `BB00001`, `BB00005`, `BB00006`, `BB00007`, and `BB00293`.
+Messages for other devices are skipped. This interprets the assignment's
+“abandon” as ignoring unsupported devices; it does not invoke the Service Bus
+Abandon operation for individual messages.
 
-## Incoming message failure policy
+## Message and API mapping
 
-The handler composes `SetPointMessageSchema.transform(toSetPoint)` and calls `safeParse`
-on each element. Valid DTOs become flat `SetPoint` values; ISO dates become numeric
-Unix millisecond timestamps. The raw DTO schema remains available independently. Malformed
-entries are logged and skipped; warnings include the entry index and validation
-issues, without the raw payload. Valid messages retain their original order and are
-passed to `processMessages` together. Empty batches and batches without valid entries
-return successfully without calling the processor.
+Incoming messages contain `device_id`, a nested `setpoint` with `value`, `unit`,
+and ISO `endTime`, plus ISO `eventTime`. Validation requires a nonempty device ID,
+numeric power, unit `kW`, and valid ISO timestamps. `toSetPoint` converts the
+validated DTO into a flat object with Unix millisecond timestamps.
 
-Processor failures propagate to fail the invocation. With automatic Service Bus
-settlement, successful invocations complete their messages, including intentionally
-skipped malformed entries; failed invocations can cause batch redelivery. This policy
-does not individually dead-letter malformed messages. Previously processed entries
-may be delivered again after a failed batch.
+The outgoing request is `POST /{deviceId}/setpoint`, authenticated with the
+`Ocp-Apim-Subscription-Key` header. Only `{ data }` is sent in the body:
 
-## Battery API client
-
-Create one client per worker and reuse it across batches:
-
-```typescript
-import { BatteredBatteriesClient } from './clients/batteredBatteries/client';
-import { loadConfig } from './config';
-
-const config = loadConfig();
-const client = new BatteredBatteriesClient({
-  apiKey: config.BATTERED_BATTERIES_API_KEY,
-  baseURL: config.BATTERED_BATTERIES_API_URL,
-});
-
-const now = Math.floor(Date.now() / 1_000);
-await client.sendSetpoint({
-  deviceId: 'BB00001',
-  data: {
-    startTime: now + 1,
-    endTime: now + 60,
-    value: -1_000, // Integer watts in API convention: negative discharges.
-  },
-});
+```json
+{
+  "data": {
+    "startTime": 1735725601,
+    "endTime": 1735725660,
+    "value": -1000
+  }
+}
 ```
 
-The handler owns input validation. The processor owns the device allowlist, kW-to-W
-conversion with sign inversion, and ordering by eventTime. `toApiRequest` performs the
-unit conversion: it rounds power to integer watts, floors the end time to Unix seconds,
-and chooses a future whole-second start after current time plus the supplied millisecond
-offset. The client takes this complete `ApiRequest`, uses `deviceId` in the URL, and
-sends only `{ data }` as JSON. If retries make startTime stale, the client
-refreshes it to the next whole second while preserving the original endTime and value.
-A command with no remaining valid start time throws `SetpointExpiredError`.
+These timestamps illustrate the format; real requests use the current time.
 
-`axios-retry` controls retries: 3 retries after the initial request, giving 4 total
-attempts. Limits remain in `RETRY_POLICY` in `constants.ts`: a 5-second timeout per
-attempt, a 30-second total budget, and exponential backoff capped
-at 5 seconds. The plugin provides exponential delay with jitter and `Retry-After`
-parsing. The client caps the backoff and honors a longer `Retry-After` separately.
-One cancellation signal bounds the whole command, including HTTP attempts and
-retry delays. It expires after 30 seconds or at the setpoint end
-time, whichever comes first. A long `Retry-After` is interrupted at that deadline;
-the client does not retry early. Constructor options remain API key and base URL;
-`loadConfig` handles configuration separately.
+| API field | Mapping |
+| --- | --- |
+| URL device ID | Internal `deviceId`, encoded as a path segment. |
+| `startTime` | `Math.floor(Date.now() / 1000) + 1`. |
+| `endTime` | Incoming end time, floored to Unix seconds. |
+| `value` | `Math.round(-incomingValue * 1000)`, in integer watts. |
 
-A normal Axios request interceptor refreshes the start time and rejects expired
-setpoints before each attempt through the pure `refreshSetpoint` helper. The
-interceptor handles both the initial object body and the serialized JSON reused
-by `axios-retry`. Axios applies its 5-second HTTP timeout per attempt;
-the command's cancellation signal provides the overall deadline. There are no
-per-attempt transformers or signal-reset hooks.
+Incoming positive power means discharge, so `1 kW` becomes `-1000 W`. Incoming
+negative power means charge. The next whole-second start reconciles the assignment's
+immediate activation requirement with the API's requirement for a future timestamp;
+it introduces up to one second of scheduling delay at mapping time.
 
-Only HTTP 204 is success; no response body is required. The client retries HTTP 408,
-429, 500, 502, 503, and 504 plus selected network/timeout errors. Other failures,
-including 400/401/404, fail immediately. `BatteredBatteriesApiError` exposes attempts,
-HTTP status, and transport code without retaining Axios config or the API key.
-The outgoing request uses a plain TypeScript type. The client rejects endTime at or
-before startTime with `TypeError`; incoming queue messages continue to use Zod
-validation. The timing helper returns a new request so retries do not mutate the
-caller's object. Timing and expiry are checked for every attempt.
+If rounding leaves `endTime <= startTime`, the mapper throws `SetpointExpiredError`
+without sending HTTP. Before every HTTP attempt, the client refreshes a stale start
+time while preserving the original end time and power. Requests with no remaining
+valid interval expire. Direct client inputs must contain safe integers and an end
+time after the supplied start time; invalid inputs throw `TypeError`.
 
-Calls run independently, including calls for the same device. Retry backoff and
-`Retry-After` apply only to the affected command; the client has no queue, shared
-cooldown, or concurrency limit. The caller controls concurrency, while the
-processor/host must manage scale and duplicate or out-of-order deliveries.
-Avoid adding an independent retry loop around the client without accounting for
-Service Bus redelivery and message lock duration.
+## Retries and failure policy
 
-Retrying a POST assumes the documented replacement behavior: resending the desired
-value with its original end time replaces the same battery command. A timeout leaves
-delivery uncertain; overlapping commands and retries can arrive out of order at
-the vendor, within one worker or across workers. The API supplies no idempotency key or version
-field. Automatic one-second clearing is not part of this client.
+The client accepts only HTTP 204 as success. `axios-retry` handles retries with
+limits from `src/clients/batteredBatteries/constants.ts`:
+
+| Policy | Value |
+| --- | --- |
+| Total attempts | At most 4: the initial attempt plus 3 retries. |
+| HTTP timeout | 5 seconds per attempt. |
+| Command time budget | 30 seconds, shortened to the command's end time. |
+| Backoff | Exponential delay with jitter, starting around 1 second and capped at 5 seconds. |
+| `Retry-After` | Honored when longer than the calculated backoff. |
+
+HTTP 408, 429, 500, 502, 503, and 504 and selected network/timeout errors are
+retryable. Other HTTP responses are not retried by the client. One cancellation
+signal covers attempts and retry waits. A long `Retry-After` can exhaust the
+command's time budget; the client stops rather than retrying early.
+
+HTTP status classification belongs to the client. The processor checks error types:
+
+| Outcome | Classification | Handler behavior |
+| --- | --- | --- |
+| `success` | HTTP 204. | Log success. |
+| `expired` | `SetpointExpiredError`, including expiry after timestamp rounding or during retries. | Log and skip. |
+| `rejected` | `SetpointRejectedError` for HTTP 400/422. | Log and skip. |
+| `failed` | Other `BatteredBatteriesApiError` failures or unexpected errors. | Log and fail the invocation after processing all results. |
+
+`SetpointRejectedError` extends `BatteredBatteriesApiError`. The base error exposes
+attempts, optional HTTP status, and transport code without retaining raw Axios
+config, response bodies, or the API key. HTTP 401/404 remain failures under the
+current policy, despite not being retried within a client call. Commands already
+expired at the processor's initial filter are removed without producing a result.
+
+With automatic Service Bus settlement, a successful invocation completes the batch,
+including skipped malformed, unsupported, and rejected messages. These entries are
+not individually dead-lettered. A failed invocation permits batch redelivery, so
+commands that already succeeded may be sent again.
+
+## Reliability limits
+
+- **Ordering:** latest-per-device selection applies only within a batch. Independent
+  invocations and retries can send an older command after a newer one. No durable
+  last-processed timestamp or per-device coordination is implemented. A production
+  design could use Service Bus sessions set by the producer and durable event-time
+  tracking. The vendor API has no conditional version check; a timed-out request
+  may still be processed remotely.
+- **Load:** selected commands run concurrently. Backoff and `Retry-After` apply only
+  to the affected command; there is no shared cooldown or outbound rate limiter.
+  Deployment scale limits are not configured in this repository. Per-device sessions
+  alone would not limit total vendor traffic. The specification provides no numeric
+  quota; deployment concurrency and any shared limiter need an agreed capacity.
+- **Delivery:** batch redelivery can repeat successful commands. POST retries assume
+  the documented replacement behavior, but the API provides no idempotency key.
+- **Message locks:** queue lock settings must accommodate the processing budget and
+  overhead. For batches, the binding's `maxAutoLockRenewalDuration` setting does not
+  apply; review the queue lock duration before deployment.
+  See the [Service Bus binding settings](https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-service-bus#hostjson-settings).
+
+The supplied one-second replacement demonstration is not implemented as an automatic
+clear operation; commands preserve their original expiry.
+
+## Repository layout
+
+| Path | Responsibility |
+| --- | --- |
+| `src/functions/forwardSetpoints.ts` | Function registration and dependency construction. |
+| `src/handlers/forwardSetpoints.ts` | Per-message validation, DTO mapping, logging, and invocation failure policy. |
+| `src/services/messageProcessor.ts` | Device filtering, batch deduplication, expiry filtering, delivery, and result classification. |
+| `src/services/types.ts` | `ProcessResult` discriminated union. |
+| `src/types/dto/setpointMessage.ts` | Zod input schema and inferred DTO type. |
+| `src/types/setpoint.ts` | Internal setpoint type using milliseconds and kW. |
+| `src/mappers/` | DTO-to-domain and domain-to-API conversions. |
+| `src/constants/allowedDevices.ts` | Device allowlist. |
+| `src/clients/batteredBatteries/` | Axios client, plain API types, retry policy, errors, and timing helpers. |
+| `src/config.ts` | API environment validation. |
+| `host.json` | Host schema version `2.0` and extension bundle providing Service Bus bindings. |
+| `tests/` | One implemented Vitest test and descriptive TODO comments. |
+
+The v4 programming model registers the function in code, so no `function.json` is
+needed. `package.json` loads compiled `dist/functions/*.js`; `tsconfig.json` enables
+strict type checking and compiles `src/` into `dist/`.
 
 ## Checks
 
@@ -189,16 +216,17 @@ npm run build
 npm test
 ```
 
-Vitest discovers `*.test.ts` files without additional configuration. The one mapper/client
-test uses fake time and a mocked Axios adapter; remaining scenarios are TODO comments.
+The single implemented test uses fake time, a mocked Axios adapter, and the real
+`axios-retry` plugin. It covers near-expiry classification, mapping and integer
+validation, 429/500 retry timing, independent concurrent calls, request headers,
+and preservation of expiry and the original request. No real HTTP requests are
+made. Other scenarios, including rejection and batch failure handling, remain
+TODO comments as requested by the assignment. See [tests/README.md](tests/README.md).
 
 ## References
 
 - [Azure Functions Node.js programming model](https://learn.microsoft.com/en-us/azure/azure-functions/functions-reference-node)
-- [Service Bus trigger and batching](https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-service-bus-trigger)
-- [Azure Functions Core Tools](https://github.com/Azure/azure-functions-core-tools)
-- [Azurite storage emulator](https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azurite)
-- [Vitest](https://vitest.dev/guide/)
-- [Axios request configuration](https://axios-http.com/docs/req_config)
-- [axios-retry configuration and Retry-After support](https://github.com/softonic/axios-retry)
-- [Transient fault handling and retry guidance](https://learn.microsoft.com/en-us/azure/architecture/best-practices/transient-faults)
+- [Service Bus trigger](https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-service-bus-trigger)
+- [Service Bus binding settings](https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-service-bus#hostjson-settings)
+- [Azure Functions concurrency](https://learn.microsoft.com/en-us/azure/azure-functions/functions-concurrency)
+- [axios-retry](https://github.com/softonic/axios-retry)

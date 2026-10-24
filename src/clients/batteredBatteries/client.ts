@@ -1,12 +1,8 @@
-import axios, { type AxiosError, type AxiosInstance } from "axios";
-import axiosRetry, { retryAfter } from "axios-retry";
-import { BatteredBatteriesApiError, SetpointExpiredError } from "./errors";
+import axios, { type AxiosInstance } from "axios";
+import { rethrowRequestError } from "./errors";
+import { configureRetries, createRequestSignal } from "./retry";
 import type { ApiRequest } from "./types";
-import {
-  RETRY_POLICY,
-  RETRYABLE_STATUSES,
-  RETRYABLE_NETWORK_CODES,
-} from "./constants";
+import { RETRY_POLICY } from "./constants";
 import { refreshSetpoint, validateRequest } from "./utils";
 
 type BatteredBatteriesClientOptions = {
@@ -29,12 +25,7 @@ export class BatteredBatteriesClient {
       maxRedirects: 0,
     });
 
-    axiosRetry(this.http, {
-      retries: RETRY_POLICY.maxAttempts - 1,
-      shouldResetTimeout: true,
-      retryCondition: isRetryable,
-      retryDelay: getRetryDelay,
-    });
+    configureRetries(this.http);
 
     this.http.interceptors.request.use((config) => {
       const body: Pick<ApiRequest, "data"> =
@@ -53,12 +44,7 @@ export class BatteredBatteriesClient {
     validateRequest(request);
     const nowMs = Date.now();
     const command = refreshSetpoint(request, nowMs);
-    // One deadline covers HTTP attempts and retry delays.
-    const lifetimeMs = Math.min(
-      RETRY_POLICY.maxElapsedMs,
-      command.data.endTime * 1_000 - nowMs,
-    );
-    const signal = AbortSignal.timeout(lifetimeMs);
+    const signal = createRequestSignal(command, nowMs);
 
     try {
       await this.http.post(
@@ -67,53 +53,7 @@ export class BatteredBatteriesClient {
         { signal },
       );
     } catch (error: unknown) {
-      const failure = axios.isAxiosError(error) ? error : undefined;
-      const attempts = failure
-        ? (failure.config?.["axios-retry"]?.retryCount ?? 0) + 1
-        : 0;
-      if (signal.aborted) {
-        if (Date.now() >= command.data.endTime * 1_000) {
-          throw new SetpointExpiredError(command.deviceId);
-        }
-        throw new BatteredBatteriesApiError(
-          `Setpoint for ${command.deviceId} exceeded its time budget.`,
-          attempts,
-          undefined,
-          "RETRY_BUDGET_EXCEEDED",
-        );
-      }
-      if (!failure) throw error;
-
-      // Raw Axios errors include request config containing the API key.
-      const status = failure.response?.status;
-      throw new BatteredBatteriesApiError(
-        `Setpoint request for ${command.deviceId} failed (${
-          status !== undefined
-            ? `HTTP ${status}`
-            : (failure.code ?? "request error")
-        }).`,
-        attempts,
-        status,
-        failure.code,
-      );
+      rethrowRequestError(error, command, signal);
     }
   }
-}
-
-function isRetryable(error: AxiosError): boolean {
-  if (error.config?.signal?.aborted) return false;
-  if (error.response) return RETRYABLE_STATUSES.has(error.response.status);
-  return RETRYABLE_NETWORK_CODES.has(error.code ?? "");
-}
-
-function getRetryDelay(retryCount: number, error: AxiosError): number {
-  const backoffMs = Math.min(
-    RETRY_POLICY.maxBackoffMs,
-    axiosRetry.exponentialDelay(
-      retryCount,
-      undefined,
-      RETRY_POLICY.initialBackoffMs / 2,
-    ),
-  );
-  return Math.max(backoffMs, retryAfter(error));
 }

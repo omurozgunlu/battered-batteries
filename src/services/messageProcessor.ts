@@ -1,57 +1,68 @@
-import type { InvocationContext } from "@azure/functions";
 import type { BatteredBatteriesClient } from "../clients/batteredBatteries/client";
 import type { SetPoint } from "../types/setpoint";
 import { isAllowedDevice } from "../constants/allowedDevices";
 import { toApiRequest } from "../mappers/toApi";
-import { SetpointExpiredError } from "../clients/batteredBatteries/errors";
+import {
+  SetpointRejectedError,
+  SetpointExpiredError,
+} from "../clients/batteredBatteries/errors";
+import { ProcessResult } from "./types";
 
 export class MessageProcessor {
   private readonly apiClient: BatteredBatteriesClient;
-  private readonly timeOffset: number = 5_000;
 
   constructor(apiClient: BatteredBatteriesClient) {
     this.apiClient = apiClient;
   }
 
-  async process(
+  async process(setpoints: SetPoint[]): Promise<ProcessResult[]> {
+    const selectedSetpoints = this.selectSetpoints(setpoints);
+
+    const results = await this.sendSetpoints(selectedSetpoints);
+    return this.handleResults(selectedSetpoints, results);
+  }
+
+  private async sendSetpoints(
     setpoints: SetPoint[],
-    invocationContext: InvocationContext,
-  ): Promise<void> {
-    const allowedSetpoints = setpoints.filter((setpoint) =>
-      isAllowedDevice(setpoint.deviceId),
-    );
-
-    const recentSetpoints = this.filterOutdated(allowedSetpoints);
-    const latestSetpoints = this.latestPerDevice(recentSetpoints);
-
-    const results = await Promise.allSettled(
-      recentSetpoints.map(async (setpoint) => {
-        const request = toApiRequest(setpoint, this.timeOffset);
-        await this.apiClient.sendSetpoint(request);
+  ): Promise<PromiseSettledResult<void>[]> {
+    return Promise.allSettled(
+      setpoints.map(async (setpoint) => {
+        await this.apiClient.sendSetpoint(toApiRequest(setpoint));
       }),
     );
+  }
 
-    const failures: unknown[] = [];
-
-    results.forEach((result, idx) => {
-      const deviceId = latestSetpoints[idx].deviceId;
+  private handleResults(
+    setpoints: SetPoint[],
+    results: PromiseSettledResult<void>[],
+  ): ProcessResult[] {
+    return results.map((result, index) => {
+      const deviceId = setpoints[index].deviceId;
       if (result.status === "fulfilled") {
-        invocationContext.log(`Setpoint sent for ${deviceId}`);
-        return;
+        return { deviceId, status: "success" };
       }
-      if (result.reason instanceof SetpointExpiredError) {
-        invocationContext.warn(`Setpoint expired for ${deviceId}`);
-        return;
+      const error = result.reason;
+      if (error instanceof SetpointExpiredError) {
+        return { deviceId, status: "expired" };
       }
-      invocationContext.error(
-        `Failed to send setpoint for ${deviceId}: ${result.reason}`,
-      );
-      failures.push(result.reason);
+      if (error instanceof SetpointRejectedError) {
+        return { deviceId, status: "rejected", error };
+      }
 
-      if (failures.length > 0) {
-        throw new Error(`Failed to send setpoints for devices: ${failures}`);
-      }
+      return {
+        deviceId,
+        status: "failed",
+        error: error,
+      };
     });
+  }
+
+  private selectSetpoints(setpoints: SetPoint[]): SetPoint[] {
+    const allowed = setpoints.filter((setpoint) =>
+      isAllowedDevice(setpoint.deviceId),
+    );
+    const latest = this.latestPerDevice(allowed);
+    return this.filterOutdated(latest);
   }
 
   private latestPerDevice(setpoints: SetPoint[]): SetPoint[] {
@@ -69,6 +80,4 @@ export class MessageProcessor {
     const currentTime = Date.now();
     return setpoints.filter((setpoint) => setpoint.endTime > currentTime);
   }
-
-  private processMessage(setpoint: SetPoint) {}
 }
