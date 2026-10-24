@@ -216,12 +216,13 @@ npm run build
 npm test
 ```
 
-The single implemented test uses fake time, a mocked Axios adapter, and the real
-`axios-retry` plugin. It covers near-expiry classification, mapping and integer
-validation, 429/500 retry timing, independent concurrent calls, request headers,
-and preservation of expiry and the original request. No real HTTP requests are
-made. Other scenarios, including rejection and batch failure handling, remain
-TODO comments as requested by the assignment. See [tests/README.md](tests/README.md).
+The single implemented test in `tests/forwardSetpoints.test.ts` exercises the
+handler with a mocked processor and a real `InvocationContext`. It verifies that
+malformed messages are skipped, valid DTOs are mapped and passed to the processor
+in order, and validation warnings include the entry index and issues without the
+raw payload. It requires no Azure host, network, or timer mocks. API client,
+processor, and other handler scenarios remain descriptive TODO comments as requested
+by the assignment. See [tests/README.md](tests/README.md).
 
 ## References
 

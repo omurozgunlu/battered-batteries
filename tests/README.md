@@ -1,22 +1,19 @@
 # Tests
 
-Run `npm test`. The single implemented test in `batteredBatteries.test.ts` exercises
-the API client's 429 Retry-After and 500 backoff path using the real `axios-retry`
-plugin and a mocked Axios adapter. A second command succeeds immediately while the
-first command waits for its retries.
-Before sending valid commands, the same test checks that the processor classifies
-commands with no valid whole-second interval as expired without making HTTP requests,
-and that the earliest representable interval remains valid.
-It also checks the outgoing request and that retries preserve expiry while refreshing
-the future start time without mutating the caller's request. The request is built by
-`toApiRequest`, so the test also covers current-time scheduling and milliseconds/kW
-conversion to API seconds/watts. No real HTTP requests are made.
+Run `npm test`. The single implemented test in `forwardSetpoints.test.ts` exercises
+`createForwardSetpoints` with two valid messages separated by a malformed message.
+It checks that:
 
-The remaining scenarios are descriptive TODO comments alongside that test, as
-requested by the assignment.
+- The handler completes successfully despite the malformed entry.
+- The processor is called exactly once with the valid messages in their original
+  order, mapped to flat `SetPoint` values with millisecond timestamps.
+- The warning contains the malformed entry's index and validation issues without
+  including its raw payload.
 
-`beforeEach` resets fake time, deterministic jitter, recorded requests, and mock
-responses, then creates a fresh client, processor, and base setpoint. The test
-declares its response sequence per URL; the shared adapter records each attempt
-and returns HTTP 204 when no response is queued. `afterEach` restores spies and
-real timers.
+`beforeEach` resets the processor and logger mocks and creates an `InvocationContext`
+with the mocked logger. The real schema and mapper run; the processor is injected
+as a mock. No Azure host, credentials, HTTP adapters, or fake timers are needed.
+
+API client, processor, and other handler scenarios remain descriptive TODO comments
+alongside the test, as requested by the assignment. The previous client's retry,
+expiry, and request-format scenarios are included in those TODOs.
